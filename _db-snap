@@ -3,27 +3,16 @@
 # Zsh completion for db-snap.
 # Located at ~/.oh-my-zsh/custom/completions/_db-snap (already on $fpath via oh-my-zsh).
 # Reload with: rm -f ~/.zcompdump && exec zsh
-
-_db_snap_find_project_root() {
-  local d="$PWD"
-  while [[ "$d" != "/" ]]; do
-    if [[ -f "$d/.env" && ( -f "$d/docker-compose.yml" || -f "$d/compose.yml" ) ]]; then
-      echo "$d"
-      return 0
-    fi
-    d="${d:h}"
-  done
-  return 1
-}
+#
+# Project-scoped data (sites, labels) comes from the script's hidden
+# `__sites` / `__labels` commands so project detection and IGNORE_SITES
+# logic live in one place. Unquoted ${(f)...} drops the empty element
+# you'd otherwise get when the script prints nothing.
 
 _db_snap_sites() {
-  local root
-  root="$(_db_snap_find_project_root)" || return
-  [[ -d "$root/web/sites" ]] || return
   local -a sites
-  sites=("${(@f)$(find "$root/web/sites" -maxdepth 1 -mindepth 1 -type d \
-    ! -name default ! -name simpletest ! -name all ! -name files \
-    -printf '%f\n' 2>/dev/null | sort)}")
+  sites=(${(f)"$(db-snap __sites 2>/dev/null)"})
+  (( ${#sites} )) || return
   _describe -t sites 'site' sites
 }
 
@@ -42,14 +31,9 @@ _db_snap_sites_or_refresh_all() {
 }
 
 _db_snap_labels() {
-  local root project base
-  root="$(_db_snap_find_project_root)" || return
-  project="${root:t}"
-  base="$HOME/.local/share/db-snapshots/$project"
-  [[ -d "$base" ]] || return
   local -a labels
-  labels=("${(@f)$(cd "$base" && print -l **/*.sql.gz(N:t:r:r))}")
-  labels=(${(u)labels})
+  labels=(${(f)"$(db-snap __labels 2>/dev/null)"})
+  (( ${#labels} )) || return
   _describe -t labels 'label' labels
 }
 
@@ -99,7 +83,7 @@ _db-snap() {
         'save:Dump current DB to a snapshot'
         'snap:Alias for save'
         'restore:Restore a saved snapshot'
-        'refresh:Replace live DB with newest project dump + cim'
+        'refresh:Replace live DB with newest project dump + drush deploy'
         'list:List saved snapshots'
         'ls:Alias for list'
         'info:Show install + snapshot paths'
@@ -131,7 +115,7 @@ _db-snap() {
         clear)
           _arguments \
             '1:target:_db_snap_sites_or_refresh_all' \
-            '--rm[Delete permanently instead of moving to .bin]'
+            '--rm[Delete permanently instead of moving to ~/dumps/bin]'
           ;;
       esac
       ;;

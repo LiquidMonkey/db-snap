@@ -41,6 +41,10 @@
 
 set -euo pipefail
 
+# ════════════════════════════════════════════════════════════════════════
+# Bootstrap — project detection, .env, config layers
+# ════════════════════════════════════════════════════════════════════════
+
 # Walk up from $PWD to find the project root (contains .env + docker-compose.yml).
 find_project_root() {
   local d="$PWD"
@@ -97,6 +101,10 @@ DB_SERVICE="${DB_SERVICE:-mariadb}"
 PHP_SERVICE="${PHP_SERVICE:-php}"
 AUTOSAVE_PREFIX="_autosave-"
 AUTOSAVE_KEEP="${DB_SNAP_AUTOSAVE_KEEP:-3}"
+
+# ════════════════════════════════════════════════════════════════════════
+# Helpers — validation, site/DB resolution, dump + import primitives
+# ════════════════════════════════════════════════════════════════════════
 
 require_project() {
   if [[ -z "$PROJECT_ROOT" ]]; then
@@ -257,6 +265,39 @@ prune_autosaves() {
   echo "Pruned ${#old[@]} old autosave(s) (keep $AUTOSAVE_KEEP)."
 }
 
+# Replace a DB with a .sql.gz: verify gzip → autosave → drop/create → import → prune → cr.
+import_gz() {
+  local file="$1" db_name="$2" site="$3"
+  echo "Verifying dump integrity ..."
+  if ! gunzip -t "$file" 2>/dev/null; then
+    echo "ERROR: dump is corrupt or unreadable: $file" >&2
+    echo "Aborting before touching the database." >&2
+    exit 1
+  fi
+  autosave_db "$db_name" "$site"
+  echo "Dropping and recreating '$db_name' ..."
+  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -e "
+    DROP DATABASE IF EXISTS \`$db_name\`;
+    CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    GRANT ALL ON \`$db_name\`.* TO '$DB_USER'@'%';
+    FLUSH PRIVILEGES;
+  "
+  echo "Importing $file ..."
+  gunzip -c "$file" | dc exec -T -e MYSQL_PWD="$DB_PASSWORD" "$DB_SERVICE" mysql -u "$DB_USER" "$db_name"
+  # Prune only after a successful import — the file being restored may itself
+  # be an old autosave.
+  prune_autosaves "$site"
+  echo "Clearing Drupal cache ..."
+  local site_args=()
+  [[ -n "$site" ]] && site_args=(-l "$site")
+  dc exec -T "$PHP_SERVICE" drush "${site_args[@]}" cr || echo "(drush cr failed — clear manually)"
+  echo "Done."
+}
+
+# ════════════════════════════════════════════════════════════════════════
+# Commands — one cmd_* per subcommand (+ their per-site workers)
+# ════════════════════════════════════════════════════════════════════════
+
 cmd_save() {
   local label="${1:?usage: save <label> [site]}" site
   validate_label "$label"
@@ -375,34 +416,6 @@ cmd_refresh_all() {
   echo "OK   (${#ok[@]}): ${ok[*]:-none}"
   echo "FAIL (${#fail[@]}): ${fail[*]:-none}"
   [[ ${#fail[@]} -eq 0 ]] || exit "$worst"
-}
-
-import_gz() {
-  local file="$1" db_name="$2" site="$3"
-  echo "Verifying dump integrity ..."
-  if ! gunzip -t "$file" 2>/dev/null; then
-    echo "ERROR: dump is corrupt or unreadable: $file" >&2
-    echo "Aborting before touching the database." >&2
-    exit 1
-  fi
-  autosave_db "$db_name" "$site"
-  echo "Dropping and recreating '$db_name' ..."
-  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -e "
-    DROP DATABASE IF EXISTS \`$db_name\`;
-    CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    GRANT ALL ON \`$db_name\`.* TO '$DB_USER'@'%';
-    FLUSH PRIVILEGES;
-  "
-  echo "Importing $file ..."
-  gunzip -c "$file" | dc exec -T -e MYSQL_PWD="$DB_PASSWORD" "$DB_SERVICE" mysql -u "$DB_USER" "$db_name"
-  # Prune only after a successful import — the file being restored may itself
-  # be an old autosave.
-  prune_autosaves "$site"
-  echo "Clearing Drupal cache ..."
-  local site_args=()
-  [[ -n "$site" ]] && site_args=(-l "$site")
-  dc exec -T "$PHP_SERVICE" drush "${site_args[@]}" cr || echo "(drush cr failed — clear manually)"
-  echo "Done."
 }
 
 cmd_list() {
@@ -637,7 +650,29 @@ cmd_clear_all() {
   done
 }
 
+# ════════════════════════════════════════════════════════════════════════
+# Completion helpers — hidden, called by _db-snap. Keep output plain:
+# one item per line, nothing on stdout when not applicable, exit 0.
+# ════════════════════════════════════════════════════════════════════════
+
+cmd_complete_sites() {
+  [[ -n "$PROJECT_ROOT" ]] || return 0
+  list_subsites || true
+}
+
+cmd_complete_labels() {
+  [[ -n "$PROJECT_ROOT" && -d "$SNAPSHOT_DIR" ]] || return 0
+  find "$SNAPSHOT_DIR" -maxdepth 2 -type f -name '*.sql.gz' -printf '%f\n' \
+    | sed 's/\.sql\.gz$//' | sort -u
+}
+
+# ════════════════════════════════════════════════════════════════════════
+# Dispatcher
+# ════════════════════════════════════════════════════════════════════════
+
 case "${1:-}" in
+  __sites)    cmd_complete_sites ;;
+  __labels)   cmd_complete_labels ;;
   save|snap)  require_project; shift; cmd_save "$@" ;;
   restore)    require_project; shift; cmd_restore "$@" ;;
   refresh)    require_project; shift; cmd_refresh "$@" ;;
