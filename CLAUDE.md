@@ -34,6 +34,12 @@ db-snap clear       [site|all] [--rm]            Move project dump files (docker
 
 Aliases live in the dispatcher (`case "${1:-}" in save|snap) ...`). When adding a new alias, also add it to `_db-snap` and the help header.
 
+Hidden commands (not in help): `__sites` and `__labels` — plain one-per-line output for the zsh completion. Empty output + exit 0 when not applicable (e.g. outside a project).
+
+## File layout
+
+`db-snap` is one file, split by banner comments: **Bootstrap** (project root, `.env`, config layers) → **Helpers** (validators, site/DB resolution, `dump_db`, autosave, `import_gz`) → **Commands** (`cmd_*` + per-site workers) → **Completion helpers** → **Dispatcher**. Put new code in the matching section. Staying single-file is deliberate (simple install); revisit only past ~1500 lines or if structured data (metadata, JSON) appears — then Python stdlib, not split bash.
+
 ## Invariants — do not break
 
 These cut across the script and are easy to violate during edits:
@@ -52,6 +58,7 @@ These cut across the script and are easy to violate during edits:
 - **`deploy` failure on `refresh` is exit code 2**, not 1. The DB was already replaced — the non-zero exit is to flag "config drift" specifically. Preserve this distinction if you touch the error path. The per-site work lives in `refresh_one` (returns 0/1/2); `cmd_refresh` is a thin dispatcher and `cmd_refresh_all` loops it. `refresh all` runs each site as a **separate process** (`bash "$0" refresh "$site"`), then exits with the worst code (1 beats 2). Never go back to `if ( refresh_one ); then` — bash disables `set -e` inside an `if` condition (subshells included), so mid-import failures would be silently ignored.
 - **Fallback dumps need confirmation**: `~/dumps/` (any project) and, on multisite, `docker/database/` (any site) prompt before import. Only the site's own dir is trusted silently.
 - **Autosave before every drop**: `import_gz` dumps the live DB to `_autosave-<YYYYmmdd-HHMMSS>.sql.gz` (via `dump_db`) before `DROP DATABASE`, skipping empty/missing DBs. `prune_autosaves` keeps the newest `$AUTOSAVE_KEEP` (default 3) and runs **after** a successful import — the file being restored may itself be an old autosave. Env: `DB_SNAP_NO_AUTOSAVE=1`, `DB_SNAP_AUTOSAVE_KEEP=N`.
+- **Completion asks the script**: `_db-snap` gets sites/labels from `db-snap __sites` / `__labels`. Never reimplement project-root or site detection in zsh — the old copy drifted and ignored `IGNORE_SITES`.
 - **Multisite site-resolution guard**: `resolve_db_name` checks drush's `"site"` field equals `sites/<site>`. drush silently falls back to `sites/default` for unresolvable `-l` values — without the guard, a typo would drop the default site's DB.
 - **Snapshot store layout depends on whether a `site` was passed at save time**, not on whether the project is multisite. A snapshot saved without a site lands at `<base>/<project>/<label>.sql.gz`; with a site at `<base>/<project>/<site>/<label>.sql.gz`. `cmd_list_all` and `cmd_delete` both walk the two cases — keep them in sync.
 
@@ -63,7 +70,8 @@ Five places to touch, in order:
 2. **Dispatcher** at the bottom — add `name|alias) require_project; shift; cmd_name "$@" ;;`. Drop `require_project` only if the command genuinely works outside a project (currently only `info` and `list`/`ls`).
 3. **Header usage block** at the top of the script — keep alignment consistent with the existing rows. The fallback case prints every `#` line from line 2 until the first non-comment line, so the header can grow freely — just keep it one contiguous comment block.
 4. **Zsh completion** in `~/.oh-my-zsh/custom/completions/_db-snap` — add to the `subcommands` array (with a description) and add a per-command branch in the `case $words[1]` block. Reuse the existing helpers (`_db_snap_sites`, `_db_snap_labels`, `_db_snap_projects`, etc.) where possible. Verify with `zsh -n` after editing.
-5. **Reload completion** (only when testing): `rm -f ~/.zcompdump* && exec zsh`.
+5. **bats test(s)** in `test/db-snap.bats` covering the new command's happy path and its guard/error paths. Extend `test/fixtures/bin/docker` if the command makes a new kind of docker call (unknown calls exit 99 on purpose).
+6. **Reload completion** (only when testing): `rm -f ~/.zcompdump* && exec zsh`.
 
 ## Style preferences (user-specific)
 
@@ -73,11 +81,13 @@ Five places to touch, in order:
 
 ## Verifying changes
 
-There are no automated tests. After any edit:
+After any edit, from the repo root:
 
-1. `zsh -n ~/.oh-my-zsh/custom/completions/_db-snap` — completion parses
-2. `bash -n ~/.local/bin/db-snap` — script parses
-3. `db-snap info` outside a project — confirms project-root detection still optional
-4. `db-snap ls all` — confirms cross-project listing works regardless of cwd
-5. `db-snap delete <project> <bad/name>` — confirms validators still fire on path-traversal attempts
-6. `db-snap save test_$$` and `db-snap restore test_$$` round-trip inside a real project — only run when you have a known-recoverable DB.
+1. `test/bats/bin/bats test/` — full suite. Runs against a fake `docker` (`test/fixtures/bin/docker`) with an isolated `$HOME` per test, so it never touches real DBs or snapshots.
+2. `shellcheck -S warning db-snap test/fixtures/bin/docker`
+3. `zsh -n _db-snap`
+4. Only for changes to real docker/mysql interaction: `db-snap save test_$$` + `db-snap restore test_$$` in a real project with a recoverable DB.
+
+Test gotcha: in bats, a bare `! cmd` line does **not** fail the test (unless it's the last line). Use `refute_log` from `test/test_helper.bash`, or `[ -z "$(...)" ]`.
+
+bats-core is a git submodule pinned at `v1.11.1` (`test/bats`). Fresh clone: `git clone --recurse-submodules`, or `git submodule update --init`.

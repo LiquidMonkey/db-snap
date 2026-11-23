@@ -151,3 +151,20 @@ rm -f ~/.oh-my-zsh/custom/completions/_db-snap
 rm -rf ~/.local/share/db-snapshots         # only if you also want the saved dumps gone
 rm -f ~/.zcompdump*
 ```
+
+## Development
+
+The repo lives at `~/.local/share/db-snap/`; the installed script and completion are symlinks into it:
+
+```bash
+git clone --recurse-submodules git@github.com:LiquidMonkey/db-snap.git ~/.local/share/db-snap
+ln -s ~/.local/share/db-snap/db-snap  ~/.local/bin/db-snap
+ln -s ~/.local/share/db-snap/_db-snap ~/.oh-my-zsh/custom/completions/_db-snap
+```
+
+Run the tests (bats-core is vendored as a submodule; the suite uses a fake `docker`, so no stack or DB is needed):
+
+```bash
+test/bats/bin/bats test/
+shellcheck -S warning db-snap test/fixtures/bin/docker
+```

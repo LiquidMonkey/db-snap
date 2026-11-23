@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# Fake `docker` for the bats suite. Understands only the calls db-snap makes:
+#   docker compose exec -T [-e K=V]... <service> <cmd...>
+# Every call is appended to $FAKE_LOG. Behaviour is steered by env vars:
+#   FAKE_RESOLVE_DEFAULT=1   drush status reports sites/default (simulates -l fallback)
+#   FAKE_TABLES=N            table count for autosave check (default 5)
+#   FAKE_IMPORT_FAIL=<db>    import into <db> fails (exit 1)
+#   FAKE_DEPLOY_RC=N         exit code of `drush deploy` (default 0)
+# Unknown calls exit 99 so tests notice unexpected docker usage.
+
+set -euo pipefail
+
+echo "$*" >> "${FAKE_LOG:?FAKE_LOG not set}"
+
+[[ "${1:-}" == compose && "${2:-}" == exec ]] || { echo "fake docker: unhandled: $*" >&2; exit 99; }
+shift 2
+[[ "${1:-}" == -T ]] && shift
+while [[ "${1:-}" == -e ]]; do shift 2; done
+shift # service name
+
+case "$1" in
+  drush)
+    if [[ "${2:-}" == -l && "${4:-}" == status ]]; then
+      site="$3"
+      resolved="$site"
+      [[ "${FAKE_RESOLVE_DEFAULT:-}" == 1 ]] && resolved=default
+      printf '{\n    "db-name": "db_%s",\n    "site": "sites/%s"\n}\n' "$site" "$resolved"
+      exit 0
+    fi
+    case " $* " in
+      *" deploy -y "*) exit "${FAKE_DEPLOY_RC:-0}" ;;
+      *" cr "*)        exit 0 ;;
+    esac
+    ;;
+  mysqldump)
+    echo "-- fake dump"
+    exit 0
+    ;;
+  mysql)
+    if [[ "$*" == *"-N -B -e"* ]]; then
+      echo "${FAKE_TABLES:-5}"
+      exit 0
+    fi
+    if [[ "${2:-}" == -u && "${3:-}" == root && "${4:-}" == -e ]]; then
+      exit 0 # drop/create/grant
+    fi
+    if [[ "${2:-}" == -u && $# -eq 4 ]]; then
+      cat > /dev/null # import
+      [[ -n "${FAKE_IMPORT_FAIL:-}" && "$4" == "$FAKE_IMPORT_FAIL" ]] && exit 1
+      exit 0
+    fi
+    ;;
+esac
+
+echo "fake docker: unhandled: $*" >&2
+exit 99
