@@ -34,7 +34,7 @@ case "$1" in
     esac
     ;;
   mysqldump)
-    echo "-- fake dump"
+    printf -- "-- fake dump\n-- Dump completed on 2026-01-01 00:00:00\n"
     exit 0
     ;;
   mysql)

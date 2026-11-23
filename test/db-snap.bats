@@ -104,7 +104,7 @@ load test_helper
   make_multisite
   make_dump "$SNAPS/site_a/x.sql.gz"
   export FAKE_RESOLVE_DEFAULT=1
-  run_snap restore x site_a
+  run_snap -y restore x site_a
   [ "$status" -eq 1 ]
   [[ "$output" == *"resolved to 'sites/default'"* ]]
   refute_log "DROP DATABASE"
@@ -133,7 +133,7 @@ load test_helper
 @test "restore autosaves the live DB before dropping it" {
   make_singlesite
   make_dump "$SNAPS/base.sql.gz"
-  run_snap restore base
+  run_snap -y restore base
   [ "$status" -eq 0 ]
   ls "$SNAPS"/_autosave-*.sql.gz
   local dump drop
@@ -147,7 +147,7 @@ load test_helper
   make_singlesite
   make_dump "$SNAPS/base.sql.gz"
   export FAKE_TABLES=0
-  run_snap restore base
+  run_snap -y restore base
   [ "$status" -eq 0 ]
   [[ "$output" == *"Autosave skipped"* ]]
   [ -z "$(ls "$SNAPS"/_autosave-*.sql.gz 2>/dev/null)" ]
@@ -156,7 +156,7 @@ load test_helper
 @test "DB_SNAP_NO_AUTOSAVE=1 skips autosave" {
   make_singlesite
   make_dump "$SNAPS/base.sql.gz"
-  DB_SNAP_NO_AUTOSAVE=1 run_snap restore base
+  DB_SNAP_NO_AUTOSAVE=1 run_snap -y restore base
   [ "$status" -eq 0 ]
   refute_log mysqldump
 }
@@ -166,7 +166,7 @@ load test_helper
   make_dump "$SNAPS/base.sql.gz"
   local i
   for i in 1 2 3 4 5; do make_dump "$SNAPS/_autosave-20200101-00000$i.sql.gz"; done
-  run_snap restore base
+  run_snap -y restore base
   [ "$status" -eq 0 ]
   [ "$(ls "$SNAPS"/_autosave-*.sql.gz | wc -l)" -eq 3 ]
   [ -f "$SNAPS/_autosave-20200101-000005.sql.gz" ]
@@ -178,7 +178,7 @@ load test_helper
   make_singlesite
   local i
   for i in 1 2 3 4; do make_dump "$SNAPS/_autosave-20200101-00000$i.sql.gz"; done
-  run_snap restore _autosave-20200101-000001
+  run_snap -y restore _autosave-20200101-000001
   [ "$status" -eq 0 ]
   [[ "$output" == *"Done."* ]]
 }
@@ -187,7 +187,7 @@ load test_helper
   make_singlesite
   mkdir -p "$SNAPS"
   echo "not gzip" > "$SNAPS/bad.sql.gz"
-  run_snap restore bad
+  run_snap -y restore bad
   [ "$status" -eq 1 ]
   [[ "$output" == *"corrupt"* ]]
   refute_log "DROP DATABASE"
@@ -198,7 +198,7 @@ load test_helper
 @test "refresh uses project dump without prompting and runs drush deploy" {
   make_singlesite
   make_dump "$PROJ/docker/database/prod.sql.gz"
-  run_snap refresh
+  run_snap -y refresh
   [ "$status" -eq 0 ]
   grep -q "drush deploy -y" "$FAKE_LOG"
 }
@@ -207,14 +207,14 @@ load test_helper
   make_singlesite
   make_dump "$PROJ/docker/database/prod.sql.gz"
   export FAKE_DEPLOY_RC=1
-  run_snap refresh
+  run_snap -y refresh
   [ "$status" -eq 2 ]
   [[ "$output" == *"drush deploy failed"* ]]
 }
 
 @test "refresh: no dump anywhere exits 1" {
   make_singlesite
-  run_snap refresh
+  run_snap -y refresh
   [ "$status" -eq 1 ]
   [[ "$output" == *"no *.sql.gz found"* ]]
 }
@@ -248,7 +248,7 @@ load test_helper
 @test "multisite refresh: own databases/<db>/ dir needs no prompt" {
   make_multisite
   make_dump "$PROJ/docker/database/databases/db_site_a/prod.sql.gz"
-  run_snap refresh site_a
+  run_snap -y refresh site_a
   [ "$status" -eq 0 ]
   grep -q "drush -l site_a deploy -y" "$FAKE_LOG"
 }
@@ -260,7 +260,7 @@ load test_helper
   make_dump "$PROJ/docker/database/databases/db_site_a/prod.sql.gz"
   make_dump "$PROJ/docker/database/databases/db_site_b/prod.sql.gz"
   export FAKE_IMPORT_FAIL=db_site_a
-  run_snap refresh all
+  run_snap -y refresh all
   [ "$status" -eq 1 ]
   [[ "$output" == *"OK   (1): site_b"* ]]
   [[ "$output" == *"FAIL (1): site_a"* ]]
@@ -273,7 +273,7 @@ load test_helper
   make_dump "$PROJ/docker/database/databases/db_site_a/prod.sql.gz"
   make_dump "$PROJ/docker/database/databases/db_site_b/prod.sql.gz"
   export FAKE_DEPLOY_RC=1
-  run_snap refresh all
+  run_snap -y refresh all
   [ "$status" -eq 2 ]
 }
 
@@ -296,4 +296,140 @@ load test_helper
   [ "$status" -eq 0 ]
   [ ! -e "$SNAPS/a.sql.gz" ]
   [ -f "$SNAPS/b.sql.gz" ]
+}
+
+# ── confirmations (#6) ──────────────────────────────────────────────────
+
+@test "restore asks first; 'n' leaves DB untouched" {
+  make_singlesite
+  make_dump "$SNAPS/base.sql.gz"
+  run_snap_input n restore base
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Replace DB 'drupal' with snapshot 'base'?"* ]]
+  [[ "$output" == *"DB untouched"* ]]
+  refute_log "DROP DATABASE"
+}
+
+@test "restore with no stdin aborts cleanly (EOF = no)" {
+  make_singlesite
+  make_dump "$SNAPS/base.sql.gz"
+  run_snap restore base
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Aborted"* ]]
+  refute_log "DROP DATABASE"
+}
+
+@test "--yes works anywhere on the command line" {
+  make_singlesite
+  make_dump "$SNAPS/base.sql.gz"
+  run_snap restore base --yes
+  [ "$status" -eq 0 ]
+  grep -q "DROP DATABASE" "$FAKE_LOG"
+}
+
+@test "--yes does NOT skip the fallback-dump question" {
+  make_singlesite
+  make_dump "$HOME/dumps/other-project.sql.gz"
+  run_snap -y refresh
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"fallback dir"* ]]
+  refute_log "DROP DATABASE"
+}
+
+@test "refresh all asks once up front, then runs every site" {
+  make_multisite
+  make_dump "$PROJ/docker/database/databases/db_site_a/prod.sql.gz"
+  make_dump "$PROJ/docker/database/databases/db_site_b/prod.sql.gz"
+  run_snap_input y refresh all
+  [ "$status" -eq 0 ]
+  [ "$(grep -o 'Replace the DBs of all 2 sites' <<< "$output" | wc -l)" -eq 1 ]
+  grep -q "drush -l site_a deploy -y" "$FAKE_LOG"
+  grep -q "drush -l site_b deploy -y" "$FAKE_LOG"
+}
+
+@test "save asks before overwriting; -y overwrites" {
+  make_singlesite
+  run_snap save x
+  run_snap save x
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"exists. Overwrite?"* ]]
+  run_snap -y save x
+  [ "$status" -eq 0 ]
+}
+
+# ── truncated dumps (#12) ───────────────────────────────────────────────
+
+@test "dump without mysqldump trailer warns and asks, even with -y" {
+  make_singlesite
+  mkdir -p "$SNAPS"
+  echo "CREATE TABLE half" | gzip > "$SNAPS/trunc.sql.gz"
+  run_snap -y restore trunc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"may be truncated"* ]]
+  refute_log "DROP DATABASE"
+  run_snap_input y -y restore trunc
+  [ "$status" -eq 0 ]
+  grep -q "DROP DATABASE" "$FAKE_LOG"
+}
+
+# ── site arg on single-site (#7) / no stray dirs (#9) ───────────────────
+
+@test "single-site rejects a site arg (no path escape)" {
+  make_singlesite
+  run_snap save x ../../evil
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"single-site project"* ]]
+  [ ! -e "$HOME/.local/share/evil" ]
+  [ ! -e "$HOME/.local/share/db-snapshots/evil" ]
+}
+
+@test "restore of a missing label creates no directories" {
+  make_singlesite
+  run_snap -y restore nope
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"snapshot not found"* ]]
+  [ ! -d "$SNAPS" ]
+}
+
+# ── listing (#11) ───────────────────────────────────────────────────────
+
+@test "list shows name, human size and ISO mtime" {
+  make_singlesite
+  make_dump "$SNAPS/a.sql.gz"
+  touch -d "2026-03-04 05:06" "$SNAPS/a.sql.gz"
+  run_snap ls
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ a\.sql\.gz\ +[0-9.]+[KMG]?\ +2026-03-04\ 05:06 ]]
+}
+
+# ── clear (#10) ─────────────────────────────────────────────────────────
+
+@test "clear never overwrites an earlier binned dump" {
+  make_singlesite
+  mkdir -p "$HOME/dumps/bin/proj-x"
+  echo old > "$HOME/dumps/bin/proj-x/prod.sql.gz"
+  make_dump "$PROJ/docker/database/prod.sql.gz"
+  run_snap -y clear
+  [ "$status" -eq 0 ]
+  [ "$(cat "$HOME/dumps/bin/proj-x/prod.sql.gz")" = old ]
+  [ -f "$HOME/dumps/bin/proj-x/prod.1.sql.gz" ]
+}
+
+@test "clear all: declining one site skips it, others continue" {
+  make_multisite
+  make_dump "$PROJ/docker/database/databases/db_site_a/a.sql.gz"
+  make_dump "$PROJ/docker/database/databases/db_site_b/b.sql.gz"
+  run_snap_input $'n\ny' clear all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipped."* ]]
+  [ -f "$PROJ/docker/database/databases/db_site_a/a.sql.gz" ]
+  [ -f "$HOME/dumps/bin/proj-x/site_b/b.sql.gz" ]
+}
+
+@test "delete with no stdin keeps the snapshot" {
+  make_singlesite
+  make_dump "$SNAPS/a.sql.gz"
+  run_snap delete proj-x a
+  [ "$status" -eq 1 ]
+  [ -f "$SNAPS/a.sql.gz" ]
 }

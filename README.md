@@ -92,6 +92,15 @@ db-snap ls all
 
 Run `db-snap` with no arguments for the full usage block.
 
+### Prompts and `--yes`
+
+Destructive commands (restore, refresh, overwrite on save, delete, clear) ask before acting. Add `-y` / `--yes` anywhere on the line, or set `DB_SNAP_YES=1`, to skip those. Two warnings always ask regardless, because they mean the data itself may be wrong:
+
+- **fallback dump** — `refresh` found no dump for this site and would use one from `~/dumps/` (or `docker/database/` on multisite)
+- **truncated dump** — the file has no `-- Dump completed` trailer
+
+Without a terminal (piped / closed stdin), every prompt answers "no".
+
 ## Snapshot store
 
 ```

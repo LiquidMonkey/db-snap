@@ -49,7 +49,7 @@ make_multisite() {
 # Write a valid gzip dump at $1.
 make_dump() {
   mkdir -p "$(dirname "$1")"
-  echo "-- dump $1" | gzip > "$1"
+  printf -- "-- dump %s\n-- Dump completed on 2026-01-01 00:00:00\n" "$1" | gzip > "$1"
 }
 
 # Fail if the docker log contains $1. (Bare `! grep` does NOT fail a bats
