@@ -119,6 +119,19 @@ require_project() {
 
 dc() { docker compose "$@"; }
 
+# drush in the php container, scoped with -l <site> when a site is given.
+drush_site() {
+  local site="$1"; shift
+  local -a site_args=()
+  [[ -n "$site" ]] && site_args=(-l "$site")
+  dc exec -T "$PHP_SERVICE" drush "${site_args[@]}" "$@"
+}
+
+# mysql as root in the DB container (for DROP/CREATE/GRANT and information_schema).
+db_root() {
+  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root "$@"
+}
+
 # Detect subsite dirs (everything in web/sites/ that isn't default/simpletest/files,
 # plus any dirs listed in IGNORE_SITES_ARR from the project's .db-snap config).
 list_subsites() {
@@ -164,7 +177,7 @@ resolve_db_name() {
     db="${DB_NAME:?DB_NAME missing from .env}"
   else
     local json site_path
-    json="$(dc exec -T "$PHP_SERVICE" drush -l "$site" status --format=json 2>/dev/null || true)"
+    json="$(drush_site "$site" status --format=json 2>/dev/null || true)"
     db="$(grep -oP '"db-name":\s*"\K[^"]+' <<< "$json" || true)"
     site_path="$(grep -oP '"site":\s*"\K[^"]+' <<< "$json" | tr -d '\\' || true)"
     if [[ -z "$db" ]]; then
@@ -266,8 +279,7 @@ dump_db() {
 
 # Table count for a DB (0 when DB missing).
 db_table_count() {
-  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -N -B -e \
-    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$1';"
+  db_root -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$1';"
 }
 
 # Snapshot the live DB before it gets dropped. Skips empty/missing DBs.
@@ -291,9 +303,9 @@ autosave_db() {
 prune_autosaves() {
   local site="$1"
   local dir="$SNAPSHOT_DIR${site:+/$site}"
-  local -a old=()
+  local -a old
   local f
-  while IFS= read -r f; do old+=("$f"); done < <(
+  mapfile -t old < <(
     find "$dir" -maxdepth 1 -type f -name "${AUTOSAVE_PREFIX}*.sql.gz" -printf '%f\n' \
       | sort -r | tail -n +"$((AUTOSAVE_KEEP + 1))"
   )
@@ -321,7 +333,7 @@ import_gz() {
   fi
   autosave_db "$db_name" "$site"
   echo "Dropping and recreating '$db_name' ..."
-  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -e "
+  db_root -e "
     DROP DATABASE IF EXISTS \`$db_name\`;
     CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
     GRANT ALL ON \`$db_name\`.* TO '$DB_USER'@'%';
@@ -333,9 +345,7 @@ import_gz() {
   # be an old autosave.
   prune_autosaves "$site"
   echo "Clearing Drupal cache ..."
-  local site_args=()
-  [[ -n "$site" ]] && site_args=(-l "$site")
-  dc exec -T "$PHP_SERVICE" drush "${site_args[@]}" cr || echo "(drush cr failed — clear manually)"
+  drush_site "$site" cr || echo "(drush cr failed — clear manually)"
   echo "Done."
 }
 
@@ -418,10 +428,7 @@ EOF
   fi
   import_gz "$newest" "$db_name" "$site"
   echo "Running drush deploy (updb + cim + cr + deploy hooks) ..."
-  local deploy_args=()
-  [[ -n "$site" ]] && deploy_args+=(-l "$site")
-  deploy_args+=(deploy -y)
-  if ! dc exec -T "$PHP_SERVICE" drush "${deploy_args[@]}"; then
+  if ! drush_site "$site" deploy -y; then
     echo >&2
     echo "WARNING: drush deploy failed. Fresh DB imported but updates/config NOT fully applied." >&2
     echo "  Resolve manually before continuing (drush updb -y, drush cim -y, ...)." >&2
@@ -439,9 +446,8 @@ cmd_refresh_all() {
     echo "ERROR: 'refresh all' is for multisite projects — use plain 'refresh'." >&2
     exit 1
   fi
-  local -a sites=() ok=() fail=()
-  local s
-  while IFS= read -r s; do sites+=("$s"); done < <(list_subsites)
+  local -a sites ok=() fail=()
+  mapfile -t sites < <(list_subsites)
   echo "Refreshing all ${#sites[@]} sites: ${sites[*]}"
   confirm "Replace the DBs of all ${#sites[@]} sites?$(autosave_note)" \
     || { echo "Aborted. DBs untouched."; exit 1; }
@@ -689,9 +695,8 @@ cmd_clear_all() {
     echo "ERROR: 'clear all' is for multisite — use plain 'clear' for single-site." >&2
     exit 1
   fi
-  local -a sites=()
-  local s
-  while IFS= read -r s; do sites+=("$s"); done < <(list_subsites)
+  local -a sites
+  mapfile -t sites < <(list_subsites)
   echo "Clearing dump files for all ${#sites[@]} sites: ${sites[*]}"
   echo
   local site

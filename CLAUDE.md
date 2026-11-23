@@ -59,7 +59,7 @@ These cut across the script and are easy to violate during edits:
 - **Fallback dumps need confirmation**: `~/dumps/` (any project) and, on multisite, `docker/database/` (any site) prompt before import. Only the site's own dir is trusted silently.
 - **Autosave before every drop**: `import_gz` dumps the live DB to `_autosave-<YYYYmmdd-HHMMSS>.sql.gz` (via `dump_db`) before `DROP DATABASE`, skipping empty/missing DBs. `prune_autosaves` keeps the newest `$AUTOSAVE_KEEP` (default 3) and runs **after** a successful import — the file being restored may itself be an old autosave. Env: `DB_SNAP_NO_AUTOSAVE=1`, `DB_SNAP_AUTOSAVE_KEEP=N`.
 - **Two prompt kinds — pick deliberately**: `confirm` = "are you sure?" (restore, refresh, overwrite, delete, clear); skipped by `-y/--yes`/`DB_SNAP_YES=1`. `ask` = data-correctness question (fallback dump, missing `-- Dump completed` trailer); **always** asks, even with `--yes`. Both print the prompt to stderr themselves (`read -p` is silent without a tty) and treat EOF as "no". Never use raw `read` for prompts.
-- **No side-effecting function in an `if`/`||`/`&&` condition**: `set -e` is off inside it, so failures inside are ignored (the old `refresh all` bug). Only pure predicates (`ask`, `confirm`, `is_multisite`) may be called that way. For "decline but continue" flows pass a mode arg instead (see `clear_dump_files ... skip|exit`).
+- **No side-effecting function in an `if`/`||`/`&&` condition**: `set -e` is off inside it, so failures inside are ignored (the old `refresh all` bug). Only pure predicates (`ask`, `confirm`, `is_multisite`) and single-command wrappers whose status *is* the command's status (`dc`, `drush_site`, `db_root`) may be called that way. For "decline but continue" flows pass a mode arg instead (see `clear_dump_files ... skip|exit`).
 - **`require_site` rejects a site arg on single-site projects** — otherwise it'd flow unvalidated into snapshot paths.
 - **`snapshot_path` is pure** (no `mkdir`). Directories are created only when writing (`dump_db`), so restore/list typos leave no stray dirs.
 - **`refresh all` asks once**, then exports `DB_SNAP_YES=1` to child processes; children still `ask` on fallback/truncated dumps.
@@ -72,7 +72,7 @@ These cut across the script and are easy to violate during edits:
 
 Five places to touch, in order:
 
-1. **`cmd_<name>` function** — the implementation. Use existing helpers (`require_site`, `resolve_db_name`, `snapshot_path`, `validate_label`, `print_snapshots`).
+1. **`cmd_<name>` function** — the implementation. Use existing helpers (`require_site`, `resolve_db_name`, `snapshot_path`, `validate_label`, `print_snapshots`, `confirm`/`ask`, `drush_site`, `db_root`, `dump_db`).
 2. **Dispatcher** at the bottom — add `name|alias) require_project; shift; cmd_name "$@" ;;`. Drop `require_project` only if the command genuinely works outside a project (currently only `info` and `list`/`ls`).
 3. **Header usage block** at the top of the script — keep alignment consistent with the existing rows. The fallback case prints every `#` line from line 2 until the first non-comment line, so the header can grow freely — just keep it one contiguous comment block.
 4. **Zsh completion** in `~/.oh-my-zsh/custom/completions/_db-snap` — add to the `subcommands` array (with a description) and add a per-command branch in the `case $words[1]` block. Reuse the existing helpers (`_db_snap_sites`, `_db_snap_labels`, `_db_snap_projects`, etc.) where possible. Verify with `zsh -n` after editing.
