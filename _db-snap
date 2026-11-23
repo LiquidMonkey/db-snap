@@ -1,0 +1,141 @@
+#compdef db-snap
+#
+# Zsh completion for db-snap.
+# Located at ~/.oh-my-zsh/custom/completions/_db-snap (already on $fpath via oh-my-zsh).
+# Reload with: rm -f ~/.zcompdump && exec zsh
+
+_db_snap_find_project_root() {
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    if [[ -f "$d/.env" && ( -f "$d/docker-compose.yml" || -f "$d/compose.yml" ) ]]; then
+      echo "$d"
+      return 0
+    fi
+    d="${d:h}"
+  done
+  return 1
+}
+
+_db_snap_sites() {
+  local root
+  root="$(_db_snap_find_project_root)" || return
+  [[ -d "$root/web/sites" ]] || return
+  local -a sites
+  sites=("${(@f)$(find "$root/web/sites" -maxdepth 1 -mindepth 1 -type d \
+    ! -name default ! -name simpletest ! -name all ! -name files \
+    -printf '%f\n' 2>/dev/null | sort)}")
+  _describe -t sites 'site' sites
+}
+
+_db_snap_sites_or_all() {
+  _db_snap_sites
+  local -a special
+  special=('all:Show snapshots across all projects')
+  _describe -t special 'special' special
+}
+
+_db_snap_sites_or_refresh_all() {
+  _db_snap_sites
+  local -a special
+  special=('all:Refresh every subsite (multisite only)')
+  _describe -t special 'special' special
+}
+
+_db_snap_labels() {
+  local root project base
+  root="$(_db_snap_find_project_root)" || return
+  project="${root:t}"
+  base="$HOME/.local/share/db-snapshots/$project"
+  [[ -d "$base" ]] || return
+  local -a labels
+  labels=("${(@f)$(cd "$base" && print -l **/*.sql.gz(N:t:r:r))}")
+  labels=(${(u)labels})
+  _describe -t labels 'label' labels
+}
+
+_db_snap_projects() {
+  local base="$HOME/.local/share/db-snapshots"
+  [[ -d "$base" ]] || return
+  local -a projects
+  projects=("${(@f)$(cd "$base" && print -l *(/N))}")
+  _describe -t projects 'project' projects
+}
+
+# delete arg2: site dir or top-level label inside <project>
+_db_snap_delete_arg2() {
+  local base="$HOME/.local/share/db-snapshots"
+  local project="${words[2]:-}"
+  local dir="$base/$project"
+  [[ -d "$dir" ]] || return
+  local -a items
+  items=("${(@f)$(cd "$dir" && print -l *(/N))}")
+  items+=("${(@f)$(cd "$dir" && print -l *.sql.gz(N:r:r))}")
+  _describe -t items 'site or label' items
+}
+
+# delete arg3: label inside <project>/<site>
+_db_snap_delete_arg3() {
+  local base="$HOME/.local/share/db-snapshots"
+  local project="${words[2]:-}" site="${words[3]:-}"
+  local dir="$base/$project/$site"
+  [[ -d "$dir" ]] || return
+  local -a labels
+  labels=("${(@f)$(cd "$dir" && print -l *.sql.gz(N:r:r))}")
+  _describe -t labels 'label' labels
+}
+
+_db-snap() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  _arguments -C \
+    '1: :->cmd' \
+    '*::arg:->args'
+
+  case $state in
+    cmd)
+      local -a subcommands
+      subcommands=(
+        'save:Dump current DB to a snapshot'
+        'snap:Alias for save'
+        'restore:Restore a saved snapshot'
+        'refresh:Replace live DB with newest project dump + cim'
+        'list:List saved snapshots'
+        'ls:Alias for list'
+        'info:Show install + snapshot paths'
+        'delete:Delete a project, site, or snapshot'
+        'rm:Alias for delete'
+        'clear:Move project dump files (docker/database/) to ~/dumps/bin/; --rm to delete'
+      )
+      _describe 'command' subcommands
+      ;;
+    args)
+      case $words[1] in
+        save|snap|restore)
+          _arguments \
+            '1:label:_db_snap_labels' \
+            '2:site:_db_snap_sites'
+          ;;
+        refresh)
+          _arguments '1:target:_db_snap_sites_or_refresh_all'
+          ;;
+        list|ls)
+          _arguments '1:site:_db_snap_sites_or_all'
+          ;;
+        delete|rm)
+          _arguments \
+            '1:project:_db_snap_projects' \
+            '2:site or label:_db_snap_delete_arg2' \
+            '3:label:_db_snap_delete_arg3'
+          ;;
+        clear)
+          _arguments \
+            '1:target:_db_snap_sites_or_refresh_all' \
+            '--rm[Delete permanently instead of moving to .bin]'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_db-snap "$@"

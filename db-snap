@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+#
+# db-snap — manage Drupal DB snapshots (save, restore, refresh, list, clear, delete).
+#
+# Run from a project root (the dir containing .env and docker-compose.yml).
+#
+# Usage:
+#   db-snap save|snap   <label> [site]              Dump current DB to a snapshot
+#   db-snap restore     <label> [site]              Restore a saved snapshot
+#   db-snap refresh                [site|all]       Replace live DB with newest project dump + drush deploy
+#   db-snap list|ls                [site|all]       List snapshots (`all` = every project)
+#   db-snap info                                    Show install + snapshot paths
+#   db-snap delete|rm   <project> [site] [label]    Delete a project, site, or snapshot
+#   db-snap clear       [site|all] [--rm]            Move project dump files to ~/dumps/bin/; --rm to delete
+#
+# [site] is the subsite key (e.g. vw_base) on multisite projects. Omit on
+# single-site projects. If omitted on a multisite project the script prints
+# the available sites and exits.
+# 'refresh all' / 'clear all' = every subsite (multisite only); 'list all' = every project.
+# clear targets docker/database/ dump files (not snapshots). Bin: ~/dumps/bin/ (recover: mv, purge: rm -rf).
+#
+# `info` and `list` (without args) work outside a project. All other
+# commands must run from inside a project root.
+# Project config: .db-snap in project root — IGNORE_SITES="dir1 dir2" skips non-website site dirs.
+#
+# DB name resolution:
+#   - single-site: read from .env (DB_NAME)
+#   - multisite:   read via `drush -l <site> status --format=json` (db-name)
+#
+# Fresh dump lookup order:
+#   1. docker/database/databases/<db_name>/*.sql.gz   (multisite)
+#   2. docker/database/*.sql.gz                       (single-site)
+#   3. ~/dumps/*.sql.gz                               (fallback)
+# Fallback dumps (~/dumps, or docker/database/ on multisite) need confirmation —
+# they may belong to another site or project.
+#
+# Safety: restore/refresh first autosave the current DB as _autosave-<timestamp>
+# (newest 3 kept per site). Undo: db-snap restore _autosave-<timestamp> [site].
+# Env: DB_SNAP_NO_AUTOSAVE=1 skips autosave · DB_SNAP_AUTOSAVE_KEEP=N changes retention.
+#
+
+set -euo pipefail
+
+# Walk up from $PWD to find the project root (contains .env + docker-compose.yml).
+find_project_root() {
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    if [[ -f "$d/.env" && ( -f "$d/docker-compose.yml" || -f "$d/compose.yml" ) ]]; then
+      echo "$d"
+      return
+    fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+SNAPSHOT_BASE="$HOME/.local/share/db-snapshots"
+DUMP_BIN="$HOME/dumps/bin"
+GLOBAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/db-snap/config"
+PROJECT_ROOT="$(find_project_root || true)"
+GLOBAL_IGNORE_ARR=()
+PROJECT_IGNORE_ARR=()
+
+if [[ -f "$GLOBAL_CONFIG" ]]; then
+  _raw="$(grep '^IGNORE_SITES=' "$GLOBAL_CONFIG" | head -1 | cut -d= -f2-)"
+  if [[ -n "$_raw" ]]; then
+    IFS=' ' read -r -a GLOBAL_IGNORE_ARR <<< "$_raw"
+  fi
+  unset _raw
+fi
+
+if [[ -n "$PROJECT_ROOT" ]]; then
+  cd "$PROJECT_ROOT"
+  [[ -f .env ]] || { echo "ERROR: .env not found at $PROJECT_ROOT/.env" >&2; exit 1; }
+  # shellcheck disable=SC1091
+  set -a; source .env; set +a
+
+  : "${DB_USER:?DB_USER missing from .env}"
+  : "${DB_PASSWORD:?DB_PASSWORD missing from .env}"
+  : "${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD missing from .env}"
+
+  PROJECT_NAME="$(basename "$PROJECT_ROOT")"
+  SNAPSHOT_DIR="$SNAPSHOT_BASE/$PROJECT_NAME"
+
+  if [[ -f .db-snap ]]; then
+    _raw="$(grep '^IGNORE_SITES=' .db-snap | head -1 | cut -d= -f2-)"
+    if [[ -n "$_raw" ]]; then
+      IFS=' ' read -r -a PROJECT_IGNORE_ARR <<< "$_raw"
+    fi
+    unset _raw
+  fi
+fi
+
+IGNORE_SITES_ARR=("${GLOBAL_IGNORE_ARR[@]}" "${PROJECT_IGNORE_ARR[@]}")
+
+DB_SERVICE="${DB_SERVICE:-mariadb}"
+PHP_SERVICE="${PHP_SERVICE:-php}"
+AUTOSAVE_PREFIX="_autosave-"
+AUTOSAVE_KEEP="${DB_SNAP_AUTOSAVE_KEEP:-3}"
+
+require_project() {
+  if [[ -z "$PROJECT_ROOT" ]]; then
+    echo "ERROR: not inside a project (no .env + docker-compose.yml found above $PWD)." >&2
+    exit 1
+  fi
+}
+
+dc() { docker compose "$@"; }
+
+# Detect subsite dirs (everything in web/sites/ that isn't default/simpletest/files,
+# plus any dirs listed in IGNORE_SITES_ARR from the project's .db-snap config).
+list_subsites() {
+  local -a ignore_args=()
+  local d
+  for d in "${IGNORE_SITES_ARR[@]}"; do
+    ignore_args+=(! -name "$d")
+  done
+  find web/sites -maxdepth 1 -mindepth 1 -type d \
+    ! -name default ! -name simpletest ! -name all ! -name files \
+    "${ignore_args[@]}" \
+    -printf '%f\n' 2>/dev/null | sort
+}
+
+is_multisite() {
+  [[ -n "$(list_subsites)" ]]
+}
+
+# Reject anything that isn't a safe MySQL identifier — defends against
+# backtick/semicolon injection when interpolating into DROP/CREATE/GRANT.
+validate_db_name() {
+  local name="$1"
+  if [[ ! "$name" =~ ^[A-Za-z0-9_]+$ ]]; then
+    echo "ERROR: refusing to use unsafe DB name: '$name'" >&2
+    exit 1
+  fi
+}
+
+# Reject labels that could escape the snapshot dir (path traversal) or be
+# parsed as CLI options (leading dash).
+validate_label() {
+  local label="$1"
+  if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ || "$label" == *..* || "$label" == [.-]* ]]; then
+    echo "ERROR: invalid label '$label' (allowed: A-Z a-z 0-9 . _ -; no leading dot or dash, no '..')" >&2
+    exit 1
+  fi
+}
+
+# Resolve the DB name for a given site (or empty for single-site).
+resolve_db_name() {
+  local site="$1" db
+  if [[ -z "$site" ]]; then
+    db="${DB_NAME:?DB_NAME missing from .env}"
+  else
+    local json site_path
+    json="$(dc exec -T "$PHP_SERVICE" drush -l "$site" status --format=json 2>/dev/null || true)"
+    db="$(grep -oP '"db-name":\s*"\K[^"]+' <<< "$json" || true)"
+    site_path="$(grep -oP '"site":\s*"\K[^"]+' <<< "$json" | tr -d '\\' || true)"
+    if [[ -z "$db" ]]; then
+      echo "ERROR: could not resolve DB name for site '$site' via drush." >&2
+      echo "Check web/sites/$site/settings.dev.php exists and the stack is up." >&2
+      exit 1
+    fi
+    # drush silently falls back to sites/default when -l doesn't resolve —
+    # that would point us at the wrong DB.
+    if [[ "$site_path" != "sites/$site" ]]; then
+      echo "ERROR: drush -l '$site' resolved to '${site_path:-?}', not 'sites/$site'." >&2
+      echo "Check web/sites/sites.php maps '$site'. Refusing to touch DB '$db'." >&2
+      exit 1
+    fi
+  fi
+  validate_db_name "$db"
+  echo "$db"
+}
+
+# Validate site arg and print it back; for multisite, require it.
+require_site() {
+  local site="${1:-}"
+  if is_multisite; then
+    if [[ -z "$site" ]]; then
+      echo "ERROR: this is a multisite project — pass the site key as last arg." >&2
+      echo "Available sites:" >&2
+      list_subsites | sed 's/^/  /' >&2
+      exit 1
+    fi
+    if ! list_subsites | grep -qx "$site"; then
+      echo "ERROR: unknown site '$site'. Available:" >&2
+      list_subsites | sed 's/^/  /' >&2
+      exit 1
+    fi
+  fi
+  echo "$site"
+}
+
+snapshot_path() {
+  local label="$1" site="$2"
+  local dir="$SNAPSHOT_DIR${site:+/$site}"
+  mkdir -p "$dir"
+  echo "$dir/${label}.sql.gz"
+}
+
+# Print size-formatted listing of *.sql.gz in a directory, with leading indent.
+print_snapshots() {
+  local indent="$1" dir="$2"
+  ( cd "$dir" && ls -lh -- *.sql.gz ) \
+    | awk -v i="$indent" '{printf "%s%-30s %6s  %s %s %s\n", i, $9, $5, $6, $7, $8}'
+}
+
+# Dump a DB to $out atomically: write .partial, rename on success.
+dump_db() {
+  local db_name="$1" out="$2"
+  local tmp="$out.partial"
+  # Expand now — trap fires after this function's locals are gone.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$tmp'" EXIT
+  dc exec -T -e MYSQL_PWD="$DB_PASSWORD" "$DB_SERVICE" mysqldump \
+    --single-transaction --quick --no-tablespaces \
+    -u "$DB_USER" "$db_name" | gzip > "$tmp"
+  mv "$tmp" "$out"
+  trap - EXIT
+}
+
+# Table count for a DB (0 when DB missing).
+db_table_count() {
+  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -N -B -e \
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$1';"
+}
+
+# Snapshot the live DB before it gets dropped. Skips empty/missing DBs.
+autosave_db() {
+  local db_name="$1" site="$2"
+  if [[ "${DB_SNAP_NO_AUTOSAVE:-0}" == 1 ]]; then
+    echo "Autosave skipped (DB_SNAP_NO_AUTOSAVE=1)."
+    return
+  fi
+  local count; count="$(db_table_count "$db_name")"
+  if [[ "$count" -eq 0 ]]; then
+    echo "Autosave skipped ('$db_name' empty or missing)."
+    return
+  fi
+  local out; out="$(snapshot_path "${AUTOSAVE_PREFIX}$(date +%Y%m%d-%H%M%S)" "$site")"
+  echo "Autosave '$db_name' → $out ..."
+  dump_db "$db_name" "$out"
+}
+
+# Keep only the newest $AUTOSAVE_KEEP autosaves (timestamped names sort chronologically).
+prune_autosaves() {
+  local site="$1"
+  local dir="$SNAPSHOT_DIR${site:+/$site}"
+  local -a old=()
+  local f
+  while IFS= read -r f; do old+=("$f"); done < <(
+    find "$dir" -maxdepth 1 -type f -name "${AUTOSAVE_PREFIX}*.sql.gz" -printf '%f\n' \
+      | sort -r | tail -n +"$((AUTOSAVE_KEEP + 1))"
+  )
+  (( ${#old[@]} )) || return 0
+  for f in "${old[@]}"; do rm -f -- "${dir:?}/$f"; done
+  echo "Pruned ${#old[@]} old autosave(s) (keep $AUTOSAVE_KEEP)."
+}
+
+cmd_save() {
+  local label="${1:?usage: save <label> [site]}" site
+  validate_label "$label"
+  site="$(require_site "${2:-}")"
+  local db_name; db_name="$(resolve_db_name "$site")"
+  local out; out="$(snapshot_path "$label" "$site")"
+  if [[ -f "$out" ]]; then
+    read -r -p "Snapshot '$label' exists. Overwrite? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  fi
+  echo "Dumping '$db_name' → $out ..."
+  dump_db "$db_name" "$out"
+  echo "Saved: $out ($(du -h "$out" | cut -f1))"
+}
+
+cmd_restore() {
+  local label="${1:?usage: restore <label> [site]}" site
+  validate_label "$label"
+  site="$(require_site "${2:-}")"
+  local db_name; db_name="$(resolve_db_name "$site")"
+  local src; src="$(snapshot_path "$label" "$site")"
+  [[ -f "$src" ]] || { echo "ERROR: snapshot not found: $src" >&2; exit 1; }
+  import_gz "$src" "$db_name" "$site"
+}
+
+cmd_refresh() {
+  case "${1:-}" in
+    all|-a|--all) cmd_refresh_all; return ;;
+  esac
+  local site; site="$(require_site "${1:-}")"
+  refresh_one "$site"
+}
+
+# Refresh one site's live DB from its newest project dump, then drush deploy.
+# Returns: 0 ok · 1 no usable dump / aborted (DB untouched) · 2 deploy failed (DB replaced).
+refresh_one() {
+  local site="$1"
+  local db_name; db_name="$(resolve_db_name "$site")"
+  local candidates=(
+    "docker/database/databases/$db_name"
+    "docker/database"
+    "$HOME/dumps"
+  )
+  local newest="" dir
+  for dir in "${candidates[@]}"; do
+    [[ -d "$dir" ]] || continue
+    newest="$(find "$dir" -maxdepth 1 -type f -name '*.sql.gz' -printf '%T@ %p\n' \
+      | sort -nr | head -n1 | cut -d' ' -f2-)"
+    [[ -n "$newest" ]] || continue
+    echo "Using newest dump from $dir:"
+    echo "  $newest ($(date -r "$newest" '+%Y-%m-%d %H:%M'), $(du -h "$newest" | cut -f1))"
+    break
+  done
+  if [[ -z "$newest" ]]; then
+    cat >&2 <<EOF
+ERROR: no *.sql.gz found in:
+  - docker/database/databases/$db_name/
+  - docker/database/
+  - ~/dumps/
+Download a dump from the server and place it in one of those dirs, then re-run.
+EOF
+    return 1
+  fi
+  # Not owned by this site: ~/dumps is shared across projects; docker/database/
+  # on multisite may hold another site's dump.
+  if [[ "$dir" == "$HOME/dumps" || ( -n "$site" && "$dir" == "docker/database" ) ]]; then
+    echo "WARNING: fallback dir — dump may belong to another ${site:+site or }project." >&2
+    read -r -p "Import $(basename "$newest") into '$db_name'? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted. DB untouched."; return 1; }
+  fi
+  import_gz "$newest" "$db_name" "$site"
+  echo "Running drush deploy (updb + cim + cr + deploy hooks) ..."
+  local deploy_args=()
+  [[ -n "$site" ]] && deploy_args+=(-l "$site")
+  deploy_args+=(deploy -y)
+  if ! dc exec -T "$PHP_SERVICE" drush "${deploy_args[@]}"; then
+    echo >&2
+    echo "WARNING: drush deploy failed. Fresh DB imported but updates/config NOT fully applied." >&2
+    echo "  Resolve manually before continuing (drush updb -y, drush cim -y, ...)." >&2
+    return 2
+  fi
+}
+
+# Refresh every subsite (multisite only). Each site runs as a separate db-snap
+# process so one site's failure (bad dump, deploy drift) doesn't abort the rest.
+# Must be a process, not `( refresh_one )`: bash disables `set -e` inside an
+# `if` condition, subshells included, so failures would be silently ignored.
+# Exits nonzero if any site failed: 1 if any hit a hard error, else 2 for deploy-only drift.
+cmd_refresh_all() {
+  if ! is_multisite; then
+    echo "ERROR: 'refresh all' is for multisite projects — use plain 'refresh'." >&2
+    exit 1
+  fi
+  local -a sites=() ok=() fail=()
+  local s
+  while IFS= read -r s; do sites+=("$s"); done < <(list_subsites)
+  echo "Refreshing all ${#sites[@]} sites: ${sites[*]}"
+  echo
+  local site worst=0 rc
+  for site in "${sites[@]}"; do
+    echo "===> [$site]"
+    if bash "$0" refresh "$site"; then
+      ok+=("$site")
+    else
+      rc=$?
+      fail+=("$site")
+      if [[ $rc -eq 1 ]]; then
+        worst=1
+      elif [[ $worst -ne 1 ]]; then
+        worst=2
+      fi
+    fi
+    echo
+  done
+  echo "── refresh all summary ──"
+  echo "OK   (${#ok[@]}): ${ok[*]:-none}"
+  echo "FAIL (${#fail[@]}): ${fail[*]:-none}"
+  [[ ${#fail[@]} -eq 0 ]] || exit "$worst"
+}
+
+import_gz() {
+  local file="$1" db_name="$2" site="$3"
+  echo "Verifying dump integrity ..."
+  if ! gunzip -t "$file" 2>/dev/null; then
+    echo "ERROR: dump is corrupt or unreadable: $file" >&2
+    echo "Aborting before touching the database." >&2
+    exit 1
+  fi
+  autosave_db "$db_name" "$site"
+  echo "Dropping and recreating '$db_name' ..."
+  dc exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_SERVICE" mysql -u root -e "
+    DROP DATABASE IF EXISTS \`$db_name\`;
+    CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    GRANT ALL ON \`$db_name\`.* TO '$DB_USER'@'%';
+    FLUSH PRIVILEGES;
+  "
+  echo "Importing $file ..."
+  gunzip -c "$file" | dc exec -T -e MYSQL_PWD="$DB_PASSWORD" "$DB_SERVICE" mysql -u "$DB_USER" "$db_name"
+  # Prune only after a successful import — the file being restored may itself
+  # be an old autosave.
+  prune_autosaves "$site"
+  echo "Clearing Drupal cache ..."
+  local site_args=()
+  [[ -n "$site" ]] && site_args=(-l "$site")
+  dc exec -T "$PHP_SERVICE" drush "${site_args[@]}" cr || echo "(drush cr failed — clear manually)"
+  echo "Done."
+}
+
+cmd_list() {
+  case "${1:-}" in
+    all|-a|--all) cmd_list_all; return ;;
+  esac
+  if [[ -z "$PROJECT_ROOT" ]]; then
+    cmd_list_all
+    return
+  fi
+  local site; site="$(require_site "${1:-}")"
+  local dir="$SNAPSHOT_DIR${site:+/$site}"
+  if ! ls -1 "$dir"/*.sql.gz >/dev/null 2>&1; then
+    echo "No snapshots in $dir"
+    return
+  fi
+  echo "Snapshots in $dir:"
+  print_snapshots "  " "$dir"
+}
+
+cmd_info() {
+  printf '%-14s %s\n' "Script:"    "$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  printf '%-14s %s\n' "Snapshots:" "$SNAPSHOT_BASE"
+  if [[ -n "$PROJECT_ROOT" ]]; then
+    printf '%-14s %s\n' "Project:"     "$PROJECT_NAME"
+    printf '%-14s %s\n' "Project root:" "$PROJECT_ROOT"
+    printf '%-14s %s\n' "Project dir:"  "$SNAPSHOT_DIR"
+  else
+    printf '%-14s %s\n' "Project:" "(not in a project — cwd: $PWD)"
+  fi
+  if [[ -d "$SNAPSHOT_BASE" ]]; then
+    local total; total="$(du -sh "$SNAPSHOT_BASE" 2>/dev/null | cut -f1)"
+    printf '%-14s %s\n' "Total size:" "${total:-?}"
+  fi
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    printf '%-15s %s\n' "Global config:" "$GLOBAL_CONFIG"
+  else
+    printf '%-15s %s\n' "Global config:" "$GLOBAL_CONFIG (not found)"
+  fi
+  if [[ ${#GLOBAL_IGNORE_ARR[@]} -gt 0 ]]; then
+    printf '%-15s %s\n' "Global ignore:" "${GLOBAL_IGNORE_ARR[*]}"
+  fi
+  if [[ ${#PROJECT_IGNORE_ARR[@]} -gt 0 ]]; then
+    printf '%-15s %s\n' "Project ignore:" "${PROJECT_IGNORE_ARR[*]}"
+  fi
+  printf '%-14s %s\n' "Dump bin:" "$DUMP_BIN"
+  if [[ -d "$DUMP_BIN" ]]; then
+    local bin_size; bin_size="$(du -sh "$DUMP_BIN" 2>/dev/null | cut -f1)"
+    printf '%-14s %s\n' "Bin size:" "${bin_size:-?}"
+  fi
+}
+
+cmd_delete() {
+  local project="${1:-}" arg2="${2:-}" arg3="${3:-}"
+  if [[ -z "$project" ]]; then
+    cat >&2 <<EOF
+usage: delete <project> [site] [label]
+       delete <project> <label>            (single-site project)
+       delete <project>                    (whole project dir)
+EOF
+    if [[ -d "$SNAPSHOT_BASE" ]]; then
+      echo >&2
+      echo "Available projects:" >&2
+      ( cd "$SNAPSHOT_BASE" && find . -maxdepth 1 -mindepth 1 -type d -printf '  %f\n' | sort ) >&2
+    fi
+    exit 1
+  fi
+  validate_label "$project"
+  [[ -n "$arg2" ]] && validate_label "$arg2"
+  [[ -n "$arg3" ]] && validate_label "$arg3"
+
+  local target="$SNAPSHOT_BASE/$project"
+  [[ -d "$target" ]] || { echo "ERROR: no such project: $project" >&2; exit 1; }
+
+  local desc=""
+  if [[ -z "$arg2" ]]; then
+    desc="entire project '$project'"
+  elif [[ -d "$target/$arg2" ]]; then
+    if [[ -z "$arg3" ]]; then
+      target="$target/$arg2"
+      desc="site '$arg2' in project '$project'"
+    else
+      target="$target/$arg2/${arg3}.sql.gz"
+      desc="snapshot '$arg3' in $project/$arg2"
+    fi
+  elif [[ -f "$target/${arg2}.sql.gz" ]]; then
+    [[ -z "$arg3" ]] || { echo "ERROR: '$arg2' is a snapshot, no third arg expected" >&2; exit 1; }
+    target="$target/${arg2}.sql.gz"
+    desc="snapshot '$arg2' in $project"
+  else
+    echo "ERROR: '$arg2' is neither a site dir nor a snapshot label in '$project'" >&2
+    exit 1
+  fi
+
+  [[ -e "$target" ]] || { echo "ERROR: not found: $target" >&2; exit 1; }
+
+  local size; size="$(du -sh "$target" 2>/dev/null | cut -f1)"
+  read -r -p "Delete $desc (${size:-?} at $target)? [y/N] " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  rm -rf -- "$target"
+  echo "Deleted: $target"
+}
+
+cmd_list_all() {
+  if [[ ! -d "$SNAPSHOT_BASE" ]]; then
+    echo "No snapshots ($SNAPSHOT_BASE does not exist)"
+    return
+  fi
+  local found=0
+  shopt -s nullglob
+  for project_dir in "$SNAPSHOT_BASE"/*/; do
+    local project; project="$(basename "$project_dir")"
+    local printed_header=0
+    local files=("$project_dir"*.sql.gz)
+    if (( ${#files[@]} )); then
+      echo "[$project]"
+      printed_header=1
+      print_snapshots "  " "$project_dir"
+      found=1
+    fi
+    for site_dir in "$project_dir"*/; do
+      local site; site="$(basename "$site_dir")"
+      local site_files=("$site_dir"*.sql.gz)
+      (( ${#site_files[@]} )) || continue
+      if (( !printed_header )); then
+        echo "[$project]"
+        printed_header=1
+      fi
+      echo "  ($site)"
+      print_snapshots "    " "$site_dir"
+      found=1
+    done
+  done
+  shopt -u nullglob
+  if (( !found )); then
+    echo "No snapshots in $SNAPSHOT_BASE"
+  fi
+}
+
+cmd_clear() {
+  local delete_immediately=0
+  local -a pos=()
+  for arg in "$@"; do
+    case "$arg" in
+      --rm|--delete) delete_immediately=1 ;;
+      *) pos+=("$arg") ;;
+    esac
+  done
+  local site_arg="${pos[0]:-}"
+
+  case "$site_arg" in
+    all|-a|--all) cmd_clear_all "$delete_immediately"; return ;;
+  esac
+
+  if is_multisite && [[ -z "$site_arg" ]]; then
+    echo "ERROR: multisite project — pass site key or 'all'." >&2
+    echo "Available sites:" >&2
+    list_subsites | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  if [[ -n "$site_arg" ]]; then
+    validate_label "$site_arg"
+    if is_multisite && ! list_subsites | grep -qx "$site_arg"; then
+      echo "ERROR: unknown site '$site_arg'. Available:" >&2
+      list_subsites | sed 's/^/  /' >&2
+      exit 1
+    fi
+  fi
+
+  clear_dump_files "$site_arg" "$delete_immediately"
+}
+
+# Move (or delete) *.sql.gz from docker/database/ dirs for one site.
+# Skips ~/dumps — that's a shared fallback, not project-owned.
+clear_dump_files() {
+  local site="$1" delete_immediately="$2"
+  local db_name; db_name="$(resolve_db_name "$site")"
+  local -a files=()
+  local dir
+  for dir in "docker/database/databases/$db_name" "docker/database"; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r f; do files+=("$f"); done < <(
+      find "$dir" -maxdepth 1 -type f -name '*.sql.gz' 2>/dev/null | sort
+    )
+  done
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "No dump files for${site:+ '$site'} in docker/database/databases/$db_name/ or docker/database/"
+    return
+  fi
+
+  local count="${#files[@]}"
+  local size; size="$(du -shc "${files[@]}" 2>/dev/null | tail -1 | cut -f1)"
+  local label="${PROJECT_NAME}${site:+/$site}"
+
+  if (( delete_immediately )); then
+    read -r -p "Delete $count dump(s) (${size}) for '$label'? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+    rm -f "${files[@]}"
+    echo "Deleted $count dump file(s)"
+    return
+  fi
+
+  local dest_dir="$DUMP_BIN/$PROJECT_NAME${site:+/$site}"
+  read -r -p "Move $count dump(s) (${size}) for '$label' → $dest_dir/? [y/N] " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  mkdir -p "$dest_dir"
+  local f
+  for f in "${files[@]}"; do mv "$f" "$dest_dir/"; done
+  echo "Moved to $dest_dir"
+  echo "(recover: mv $dest_dir/*.sql.gz <original-dir>/)"
+}
+
+# Clear dump files for every subsite (multisite only).
+cmd_clear_all() {
+  local delete_immediately="$1"
+  if ! is_multisite; then
+    echo "ERROR: 'clear all' is for multisite — use plain 'clear' for single-site." >&2
+    exit 1
+  fi
+  local -a sites=()
+  local s
+  while IFS= read -r s; do sites+=("$s"); done < <(list_subsites)
+  echo "Clearing dump files for all ${#sites[@]} sites: ${sites[*]}"
+  echo
+  local site
+  for site in "${sites[@]}"; do
+    echo "===> [$site]"
+    clear_dump_files "$site" "$delete_immediately"
+    echo
+  done
+}
+
+case "${1:-}" in
+  save|snap)  require_project; shift; cmd_save "$@" ;;
+  restore)    require_project; shift; cmd_restore "$@" ;;
+  refresh)    require_project; shift; cmd_refresh "$@" ;;
+  list|ls)    shift; cmd_list "$@" ;;
+  info)       shift; cmd_info "$@" ;;
+  delete|rm)  shift; cmd_delete "$@" ;;
+  clear)      require_project; shift; cmd_clear "$@" ;;
+  *) awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 1 ;;
+esac
