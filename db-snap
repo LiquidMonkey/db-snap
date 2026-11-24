@@ -46,6 +46,31 @@
 set -euo pipefail
 
 # ════════════════════════════════════════════════════════════════════════
+# Output — db-snap's own lines are marked so they stand apart from
+# drush/mysql output. Color only on a tty and when NO_COLOR is unset.
+# ════════════════════════════════════════════════════════════════════════
+
+_tty() { [[ -t "$1" && -z "${NO_COLOR:-}" ]]; }
+# Whole line (prefix + message) in one color, so it can't blend into
+# drush's default-colored output.
+_out() { # <fd> <sgr-color> <prefix> <msg...>
+  local fd="$1" color="$2" prefix="$3"; shift 3
+  if ! _tty "$fd"; then
+    printf '%s%s\n' "$prefix" "$*" >&"$fd"
+    return 0
+  fi
+  printf '\e[%sm%s%s\e[0m\n' "$color" "$prefix" "$*" >&"$fd"
+}
+step()    { _out 1 '1;36' '==> '      "$@"; }  # action db-snap is taking (bold cyan)
+info()    { _out 1 '2'    '    '      "$@"; }  # detail under a step (dim)
+# Blank line first: separates the verdict from drush output above.
+# Two spaces after ✔: many fonts render it wider than one cell.
+ok()      { echo; _out 1 '1;32' '✔  ' "$@"; }  # final success (bold green)
+section() { _out 1 '1;35' '━━ '       "$@"; }  # per-site header in batch runs (bold magenta)
+warn()    { _out 2 '1;33' 'WARNING: ' "$@"; }
+err()     { _out 2 '1;31' 'ERROR: '   "$@"; }
+
+# ════════════════════════════════════════════════════════════════════════
 # Bootstrap — project detection, .env, config layers
 # ════════════════════════════════════════════════════════════════════════
 
@@ -79,7 +104,7 @@ fi
 
 if [[ -n "$PROJECT_ROOT" ]]; then
   cd "$PROJECT_ROOT"
-  [[ -f .env ]] || { echo "ERROR: .env not found at $PROJECT_ROOT/.env" >&2; exit 1; }
+  [[ -f .env ]] || { err ".env not found at $PROJECT_ROOT/.env"; exit 1; }
   # shellcheck disable=SC1091
   set -a; source .env; set +a
 
@@ -112,7 +137,7 @@ AUTOSAVE_KEEP="${DB_SNAP_AUTOSAVE_KEEP:-3}"
 
 require_project() {
   if [[ -z "$PROJECT_ROOT" ]]; then
-    echo "ERROR: not inside a project (no .env + docker-compose.yml found above $PWD)." >&2
+    err "not inside a project (no .env + docker-compose.yml found above $PWD)."
     exit 1
   fi
 }
@@ -155,7 +180,7 @@ is_multisite() {
 validate_db_name() {
   local name="$1"
   if [[ ! "$name" =~ ^[A-Za-z0-9_]+$ ]]; then
-    echo "ERROR: refusing to use unsafe DB name: '$name'" >&2
+    err "refusing to use unsafe DB name: '$name'"
     exit 1
   fi
 }
@@ -165,7 +190,7 @@ validate_db_name() {
 validate_label() {
   local label="$1"
   if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ || "$label" == *..* || "$label" == [.-]* ]]; then
-    echo "ERROR: invalid label '$label' (allowed: A-Z a-z 0-9 . _ -; no leading dot or dash, no '..')" >&2
+    err "invalid label '$label' (allowed: A-Z a-z 0-9 . _ -; no leading dot or dash, no '..')"
     exit 1
   fi
 }
@@ -181,14 +206,14 @@ resolve_db_name() {
     db="$(grep -oP '"db-name":\s*"\K[^"]+' <<< "$json" || true)"
     site_path="$(grep -oP '"site":\s*"\K[^"]+' <<< "$json" | tr -d '\\' || true)"
     if [[ -z "$db" ]]; then
-      echo "ERROR: could not resolve DB name for site '$site' via drush." >&2
+      err "could not resolve DB name for site '$site' via drush."
       echo "Check web/sites/$site/settings.dev.php exists and the stack is up." >&2
       exit 1
     fi
     # drush silently falls back to sites/default when -l doesn't resolve —
     # that would point us at the wrong DB.
     if [[ "$site_path" != "sites/$site" ]]; then
-      echo "ERROR: drush -l '$site' resolved to '${site_path:-?}', not 'sites/$site'." >&2
+      err "drush -l '$site' resolved to '${site_path:-?}', not 'sites/$site'."
       echo "Check web/sites/sites.php maps '$site'. Refusing to touch DB '$db'." >&2
       exit 1
     fi
@@ -228,19 +253,19 @@ require_site() {
   local site="${1:-}"
   if ! is_multisite; then
     if [[ -n "$site" ]]; then
-      echo "ERROR: single-site project — no site arg expected (got '$site')." >&2
+      err "single-site project — no site arg expected (got '$site')."
       exit 1
     fi
     return 0
   fi
   if [[ -z "$site" ]]; then
-    echo "ERROR: this is a multisite project — pass the site key as last arg." >&2
+    err "this is a multisite project — pass the site key as last arg."
     echo "Available sites:" >&2
     list_subsites | sed 's/^/  /' >&2
     exit 1
   fi
   if ! list_subsites | grep -qx -- "$site"; then
-    echo "ERROR: unknown site '$site'. Available:" >&2
+    err "unknown site '$site'. Available:"
     list_subsites | sed 's/^/  /' >&2
     exit 1
   fi
@@ -286,16 +311,16 @@ db_table_count() {
 autosave_db() {
   local db_name="$1" site="$2"
   if [[ "${DB_SNAP_NO_AUTOSAVE:-0}" == 1 ]]; then
-    echo "Autosave skipped (DB_SNAP_NO_AUTOSAVE=1)."
+    info "Autosave skipped (DB_SNAP_NO_AUTOSAVE=1)."
     return
   fi
   local count; count="$(db_table_count "$db_name")"
   if [[ "$count" -eq 0 ]]; then
-    echo "Autosave skipped ('$db_name' empty or missing)."
+    info "Autosave skipped ('$db_name' empty or missing)."
     return
   fi
   local out; out="$(snapshot_path "${AUTOSAVE_PREFIX}$(date +%Y%m%d-%H%M%S)" "$site")"
-  echo "Autosave '$db_name' → $out ..."
+  step "Autosave '$db_name' → $out"
   dump_db "$db_name" "$out"
 }
 
@@ -305,48 +330,49 @@ prune_autosaves() {
   local dir="$SNAPSHOT_DIR${site:+/$site}"
   local -a old
   local f
+  # First import for this project/site: snapshot dir doesn't exist yet.
+  [[ -d "$dir" ]] || return 0
   mapfile -t old < <(
     find "$dir" -maxdepth 1 -type f -name "${AUTOSAVE_PREFIX}*.sql.gz" -printf '%f\n' \
       | sort -r | tail -n +"$((AUTOSAVE_KEEP + 1))"
   )
   (( ${#old[@]} )) || return 0
   for f in "${old[@]}"; do rm -f -- "${dir:?}/$f"; done
-  echo "Pruned ${#old[@]} old autosave(s) (keep $AUTOSAVE_KEEP)."
+  info "Pruned ${#old[@]} old autosave(s) (keep $AUTOSAVE_KEEP)."
 }
 
 # Replace a DB with a .sql.gz: verify gzip → autosave → drop/create → import → prune → cr.
 import_gz() {
   local file="$1" db_name="$2" site="$3"
-  echo "Verifying dump ..."
+  step "Verifying dump"
   # One decompression pass checks both gzip integrity (pipefail) and the
   # mysqldump trailer. A valid gzip of a dump that died mid-way on the
   # server passes `gunzip -t` but has no trailer.
   local tail_bytes
   if ! tail_bytes="$(gunzip -c "$file" 2>/dev/null | tail -c 512)"; then
-    echo "ERROR: dump is corrupt or unreadable: $file" >&2
+    err "dump is corrupt or unreadable: $file"
     echo "Aborting before touching the database." >&2
     exit 1
   fi
   if [[ "$tail_bytes" != *"-- Dump completed"* ]]; then
-    echo "WARNING: no '-- Dump completed' trailer — dump may be truncated: $file" >&2
+    warn "no '-- Dump completed' trailer — dump may be truncated: $file"
     ask "Import anyway?" || { echo "Aborted. DB untouched."; exit 1; }
   fi
   autosave_db "$db_name" "$site"
-  echo "Dropping and recreating '$db_name' ..."
+  step "Dropping and recreating '$db_name'"
   db_root -e "
     DROP DATABASE IF EXISTS \`$db_name\`;
     CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
     GRANT ALL ON \`$db_name\`.* TO '$DB_USER'@'%';
     FLUSH PRIVILEGES;
   "
-  echo "Importing $file ..."
+  step "Importing $file"
   gunzip -c "$file" | dc exec -T -e MYSQL_PWD="$DB_PASSWORD" "$DB_SERVICE" mysql -u "$DB_USER" "$db_name"
   # Prune only after a successful import — the file being restored may itself
   # be an old autosave.
   prune_autosaves "$site"
-  echo "Clearing Drupal cache ..."
-  drush_site "$site" cr || echo "(drush cr failed — clear manually)"
-  echo "Done."
+  step "Clearing Drupal cache"
+  drush_site "$site" cr || warn "drush cr failed — clear manually"
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -362,9 +388,9 @@ cmd_save() {
   if [[ -f "$out" ]]; then
     confirm "Snapshot '$label' exists. Overwrite?" || { echo "Aborted."; exit 1; }
   fi
-  echo "Dumping '$db_name' → $out ..."
+  step "Dumping '$db_name' → $out"
   dump_db "$db_name" "$out"
-  echo "Saved: $out ($(du -h "$out" | cut -f1))"
+  ok "Saved: $out ($(du -h "$out" | cut -f1))"
 }
 
 cmd_restore() {
@@ -373,10 +399,11 @@ cmd_restore() {
   site="$(require_site "${2:-}")"
   local db_name; db_name="$(resolve_db_name "$site")"
   local src; src="$(snapshot_path "$label" "$site")"
-  [[ -f "$src" ]] || { echo "ERROR: snapshot not found: $src" >&2; exit 1; }
+  [[ -f "$src" ]] || { err "snapshot not found: $src"; exit 1; }
   confirm "Replace DB '$db_name' with snapshot '$label'?$(autosave_note)" \
     || { echo "Aborted. DB untouched."; exit 1; }
   import_gz "$src" "$db_name" "$site"
+  ok "Restored '$db_name' from snapshot '$label'"
 }
 
 cmd_refresh() {
@@ -403,8 +430,8 @@ refresh_one() {
     newest="$(find "$dir" -maxdepth 1 -type f -name '*.sql.gz' -printf '%T@ %p\n' \
       | sort -nr | head -n1 | cut -d' ' -f2-)"
     [[ -n "$newest" ]] || continue
-    echo "Using newest dump from $dir:"
-    echo "  $newest ($(date -r "$newest" '+%Y-%m-%d %H:%M'), $(du -h "$newest" | cut -f1))"
+    step "Using newest dump from $dir"
+    info "$(basename "$newest") ($(date -r "$newest" '+%Y-%m-%d %H:%M'), $(du -h "$newest" | cut -f1))"
     break
   done
   if [[ -z "$newest" ]]; then
@@ -421,19 +448,20 @@ EOF
   # Not owned by this site: ~/dumps is shared across projects; docker/database/
   # on multisite may hold another site's dump. Always ask (ignores --yes).
   if [[ "$dir" == "$HOME/dumps" || ( -n "$site" && "$dir" == "docker/database" ) ]]; then
-    echo "WARNING: fallback dir — dump may belong to another ${site:+site or }project." >&2
+    warn "fallback dir — dump may belong to another ${site:+site or }project."
     ask "$prompt" || { echo "Aborted. DB untouched."; return 1; }
   else
     confirm "$prompt" || { echo "Aborted. DB untouched."; return 1; }
   fi
   import_gz "$newest" "$db_name" "$site"
-  echo "Running drush deploy (updb + cim + cr + deploy hooks) ..."
+  step "Running drush deploy (updb + cim + cr + deploy hooks)"
   if ! drush_site "$site" deploy -y; then
     echo >&2
-    echo "WARNING: drush deploy failed. Fresh DB imported but updates/config NOT fully applied." >&2
+    warn "drush deploy failed. Fresh DB imported but updates/config NOT fully applied."
     echo "  Resolve manually before continuing (drush updb -y, drush cim -y, ...)." >&2
     return 2
   fi
+  ok "Refreshed '$db_name' from $(basename "$newest")"
 }
 
 # Refresh every subsite (multisite only). Each site runs as a separate db-snap
@@ -443,7 +471,7 @@ EOF
 # Exits nonzero if any site failed: 1 if any hit a hard error, else 2 for deploy-only drift.
 cmd_refresh_all() {
   if ! is_multisite; then
-    echo "ERROR: 'refresh all' is for multisite projects — use plain 'refresh'." >&2
+    err "'refresh all' is for multisite projects — use plain 'refresh'."
     exit 1
   fi
   local -a sites ok=() fail=()
@@ -456,7 +484,7 @@ cmd_refresh_all() {
   echo
   local site worst=0 rc
   for site in "${sites[@]}"; do
-    echo "===> [$site]"
+    section "[$site]"
     if bash "$0" refresh "$site"; then
       ok+=("$site")
     else
@@ -470,7 +498,7 @@ cmd_refresh_all() {
     fi
     echo
   done
-  echo "── refresh all summary ──"
+  section "refresh all summary"
   echo "OK   (${#ok[@]}): ${ok[*]:-none}"
   echo "FAIL (${#fail[@]}): ${fail[*]:-none}"
   [[ ${#fail[@]} -eq 0 ]] || exit "$worst"
@@ -546,7 +574,7 @@ EOF
   [[ -n "$arg3" ]] && validate_label "$arg3"
 
   local target="$SNAPSHOT_BASE/$project"
-  [[ -d "$target" ]] || { echo "ERROR: no such project: $project" >&2; exit 1; }
+  [[ -d "$target" ]] || { err "no such project: $project"; exit 1; }
 
   local desc=""
   if [[ -z "$arg2" ]]; then
@@ -560,15 +588,15 @@ EOF
       desc="snapshot '$arg3' in $project/$arg2"
     fi
   elif [[ -f "$target/${arg2}.sql.gz" ]]; then
-    [[ -z "$arg3" ]] || { echo "ERROR: '$arg2' is a snapshot, no third arg expected" >&2; exit 1; }
+    [[ -z "$arg3" ]] || { err "'$arg2' is a snapshot, no third arg expected"; exit 1; }
     target="$target/${arg2}.sql.gz"
     desc="snapshot '$arg2' in $project"
   else
-    echo "ERROR: '$arg2' is neither a site dir nor a snapshot label in '$project'" >&2
+    err "'$arg2' is neither a site dir nor a snapshot label in '$project'"
     exit 1
   fi
 
-  [[ -e "$target" ]] || { echo "ERROR: not found: $target" >&2; exit 1; }
+  [[ -e "$target" ]] || { err "not found: $target"; exit 1; }
 
   local size; size="$(du -sh "$target" 2>/dev/null | cut -f1)"
   confirm "Delete $desc (${size:-?} at $target)?" || { echo "Aborted."; exit 1; }
@@ -692,7 +720,7 @@ clear_dump_files() {
 cmd_clear_all() {
   local delete_immediately="$1"
   if ! is_multisite; then
-    echo "ERROR: 'clear all' is for multisite — use plain 'clear' for single-site." >&2
+    err "'clear all' is for multisite — use plain 'clear' for single-site."
     exit 1
   fi
   local -a sites
@@ -701,7 +729,7 @@ cmd_clear_all() {
   echo
   local site
   for site in "${sites[@]}"; do
-    echo "===> [$site]"
+    section "[$site]"
     clear_dump_files "$site" "$delete_immediately" skip
     echo
   done

@@ -180,7 +180,7 @@ load test_helper
   for i in 1 2 3 4; do make_dump "$SNAPS/_autosave-20200101-00000$i.sql.gz"; done
   run_snap -y restore _autosave-20200101-000001
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Done."* ]]
+  [[ "$output" == *"Restored"* ]]
 }
 
 @test "corrupt dump aborts before touching the DB" {
